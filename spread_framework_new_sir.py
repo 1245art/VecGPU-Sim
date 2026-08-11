@@ -1,0 +1,358 @@
+"""
+sir
+向量操作，计算
+状态矩阵：n*1维，0，1，2，3.....表示状态
+"""
+import cupy as cp
+import time
+import pickle
+import json
+from pathlib import Path
+import networkx as nx
+import os
+import numpy as np
+import gc
+import scipy.sparse as sp
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
+def read_edge_chunk(file_path, skip_lines, chunk_size):
+    """
+    从 .edgelist 文件分块读取边数据
+    """
+    edges = []
+    with open(file_path, 'r') as f:
+        # 跳过已读行
+        for _ in range(skip_lines):
+            next(f)
+        for _ in range(chunk_size):
+            line = f.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            u, v = int(parts[0]), int(parts[1])
+            edges.append((u, v))
+    return np.array(edges, dtype=np.int32)
+
+def get_num_nodes_from_file(file_path):
+    max_node = -1
+    with open(file_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            u, v = int(parts[0]), int(parts[1])
+            if u > max_node:
+                max_node = u
+            if v > max_node:
+                max_node = v
+    return max_node + 1
+def build_gpu_sparse_adj_from_file(file_path, directed = False,chunk_size=5000000, n_know = True):
+    print("扫描文件获取节点数...")
+    if n_know:
+        n = 10**8
+    else:
+        n = get_num_nodes_from_file(file_path)
+    print(f"节点总数: {n}")
+
+    # 初始化空的CSR矩阵（用于累加所有块）
+    adjacency_matrix = cp.sparse.csr_matrix((n, n), dtype=cp.float32)
+    skip_lines = 0
+    total_edges_processed = 0
+
+    while True:
+        # 1. 读取单块边数据
+        edges_np = read_edge_chunk(file_path, skip_lines, chunk_size)
+        if len(edges_np) == 0:
+            break
+        skip_lines += len(edges_np)
+        total_edges_processed += len(edges_np)
+        if directed:
+            expanded_edges = edges_np
+        else:
+            # 2. 扩展双向边（单块内处理）
+            expanded_edges = np.vstack((edges_np, edges_np[:, [1, 0]]))
+
+        rows_np = expanded_edges[:, 0]
+        cols_np = expanded_edges[:, 1]
+        data_np = np.ones(len(rows_np), dtype=np.float32)
+
+        # 3. 单块转为COO→再转为CSR（避免大临时数组）
+        # 先用NumPy创建COO（减少GPU显存占用）
+        coo_np = sp.coo_matrix(
+            (data_np, (rows_np, cols_np)),
+            shape=(n, n)
+        )
+        # 转GPU的CSR（单块数据量小，转换时临时内存可控）
+        chunk_csr = cp.sparse.csr_matrix(coo_np)
+
+        # 4. 累加当前块到总矩阵（CSR合并）
+        adjacency_matrix = adjacency_matrix + chunk_csr
+
+        print(f"已处理 {total_edges_processed} 条边")
+
+        # 5. 强制释放当前块的显存和内存
+        del edges_np, expanded_edges, rows_np, cols_np, data_np, coo_np, chunk_csr
+        gc.collect()
+        cp._default_memory_pool.free_all_blocks()  # 释放CuPy缓存
+
+    print("邻接矩阵构造完成！")
+    return adjacency_matrix, n
+class GenericStatePropagationGPU:
+    def __init__(self, graph, num_states, n, A):
+        # ---------- 构建稀疏邻接 ----------
+        '''
+        edges = list(graph.edges())
+        if not graph.is_directed():
+            edges = edges + [(v, u) for u, v in edges]
+        rows = cp.array([u for u, v in edges], dtype=cp.int32)
+        cols = cp.array([v for u, v in edges], dtype=cp.int32)
+        data = cp.ones(len(edges), dtype=cp.int8)
+        self.n = graph.number_of_nodes()
+        self.A = sp.csr_matrix((data, (rows, cols)), shape=(self.n, self.n))
+        '''
+        self.A = A
+        self.n = n
+        self.num_states = num_states
+        # self.state = cp.zeros(self.n, dtype=cp.int8)
+        Rw = cp.array([0.9, 0.1, 0.0], dtype=cp.float32)
+        self.state = cp.random.choice(self.num_states, size=self.n, p=Rw).astype(cp.int8)
+        self.rules = []
+
+        self.beta = 0.3
+        self.gamma = 0.1
+        self.gamma_matrix = cp.full((self.n,), 0.1, dtype=cp.float32)
+
+        self.s_num = []
+        self.i_num = []
+        self.r_num = []
+        # each_state_sums = cp.sum(self.W_states, axis=0)
+        each_state_sums = cp.bincount(self.state, minlength=self.num_states)
+        self.s_num.append(each_state_sums[0])
+        self.i_num.append(each_state_sums[1])
+        self.r_num.append(each_state_sums[2])
+
+        def p_SI(model):
+            I_mask = (model.state == 1).astype(cp.int8)
+            num_I = model.A @ I_mask
+            return 1.0 - cp.power(1.0 - model.beta, num_I)
+
+        self.add_rule(0, 1, p_SI)
+        def p_IR(model):
+            return model.gamma_matrix
+
+        self.add_rule(1, 2, p_IR)
+
+    # ---------- 添加规则 ----------
+    def add_rule(self, from_state, to_state, prob_func):
+        """
+        from_state: int
+        to_state: int
+        prob_func: function(model) -> cp.ndarray (n,)
+        """
+        self.rules.append({
+            "from": from_state,
+            "to": to_state,
+            "prob": prob_func
+        })
+
+    # ---------- 一步传播 ----------
+    def step(self):
+        new_state = self.state.copy()
+        for rule in self.rules:
+            f = rule["from"]
+            t = rule["to"]
+            mask = (self.state == f)
+            p = rule["prob"](self)
+            rand = cp.random.rand(self.n)
+            trans = mask & (rand < p)
+            new_state[trans] = t
+        self.state = new_state
+        each_state_sums = cp.bincount(self.state, minlength=self.num_states)
+
+        self.s_num.append(each_state_sums[0])
+        self.i_num.append(each_state_sums[1])
+        self.r_num.append(each_state_sums[2])
+    def states_num(self):
+        return self.s_num, self.i_num, self.r_num
+
+def spread_main(path, large = False):
+    if large:
+        adjacency_matrix, nodes_num = build_gpu_sparse_adj_from_file(path, directed=False, n_know=True)
+        graph = 0
+    else:
+        with open(path, "rb") as f:
+            graph = pickle.load(f)
+        edges = list(graph.edges())
+        if graph.is_directed():
+            expanded_edges = edges
+        else:
+            expanded_edges = edges + [(v, u) for u, v in edges]
+        rows = cp.array([edge[0] for edge in expanded_edges], dtype=cp.int32)
+        cols = cp.array([edge[1] for edge in expanded_edges], dtype=cp.int32)
+        data = cp.ones(len(expanded_edges), dtype=cp.float32)
+        nodes_num = graph.number_of_nodes()
+        adjacency_matrix = cp.sparse.csr_matrix((data, (rows, cols)), shape=(nodes_num, nodes_num))
+    all_s = []
+    all_i = []
+    all_r = []
+    all_time = []
+    for j in range(20):
+        sir = GenericStatePropagationGPU(graph, 3, nodes_num, adjacency_matrix)
+        time1 = time.time()
+        for i in range(100):
+            sir.step()
+        s_num, i_num, r_num = sir.states_num()
+        time2 = time.time()
+        all_s.append([v.item() for v in s_num])
+        all_i.append([v.item() for v in i_num])
+        all_r.append([v.item() for v in r_num])
+        all_time.append(time2 - time1)
+    data_result = {
+        'n': nodes_num,
+        's_num': all_s,
+        'i_num': all_i,
+        'r_num': all_r,
+        'time': all_time
+    }
+    return data_result
+
+def spread_real_main(path, large = False, directed = False):
+    if large:
+        if directed:
+            adjacency_matrix, nodes_num = build_gpu_sparse_adj_from_file(path, directed=True, n_know=False)
+        else:
+            adjacency_matrix, nodes_num = build_gpu_sparse_adj_from_file(path, directed=False, n_know=False)
+        graph = 0
+    else:
+        if directed:
+            graph = nx.read_edgelist(path, nodetype=int, create_using=nx.DiGraph(), data=False)
+        else:
+            graph = nx.read_edgelist(path, nodetype=int, create_using=nx.Graph(), data=False)
+        graph = nx.convert_node_labels_to_integers(graph, first_label=0)
+        edges = list(graph.edges())
+        if graph.is_directed():
+            expanded_edges = edges
+        else:
+            expanded_edges = edges + [(v, u) for u, v in edges]
+        rows = cp.array([edge[0] for edge in expanded_edges], dtype=cp.int32)
+        cols = cp.array([edge[1] for edge in expanded_edges], dtype=cp.int32)
+        data = cp.ones(len(expanded_edges), dtype=cp.float32)
+        nodes_num = graph.number_of_nodes()
+        adjacency_matrix = cp.sparse.csr_matrix((data, (rows, cols)), shape=(nodes_num, nodes_num))
+    all_s = []
+    all_i = []
+    all_r = []
+    all_time = []
+    for j in range(20):
+        sir = GenericStatePropagationGPU(graph, 3, nodes_num, adjacency_matrix)
+        time1 = time.time()
+        for i in range(100):
+            sir.step()
+        s_num, i_num, r_num = sir.states_num()
+        time2 = time.time()
+        all_s.append([v.item() for v in s_num])
+        all_i.append([v.item() for v in i_num])
+        all_r.append([v.item() for v in r_num])
+        all_time.append(time2 - time1)
+    data_result = {
+        'n': nodes_num,
+        's_num': all_s,
+        'i_num': all_i,
+        'r_num': all_r,
+        'time': all_time
+    }
+    return data_result
+def main_2_7():
+    for n in [2, 3, 4, 5, 6, 7]:
+        for p in [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1]:
+            path = f'./network/small_world_network/small_world_network_10**{n}_{p}.gpickle'
+            data = spread_main(path)
+            with open(f"./result/small_world_network/result_framework_new_state_sir_20_step_{10**n}_{p}.json", "w",
+                      encoding="utf-8") as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            print(f'framework {10**n}个节点p为{p}的网络结果已保存')
+
+        for seed in [0, 10000, 20000, 30000, 40000, 50000, 60000, 70000, 80000, 90000]:
+            path = f'./network/scale_free_network/scale_free_net_10**{n}_seed{seed}.gpickle'
+            data = spread_main(path)
+            with open(f"./result/scale_free_network/result_framework_new_state_sir_20_step_{10**n}_seed{seed}.json", "w",
+                      encoding="utf-8") as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            print(f'framework {10**n}个节点seed为{seed}的网络结果已保存')
+def main_8():
+
+    for p in [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1]:
+        path = f"./network/small_world_network_10**8_{p}.edgelist"
+        data = spread_main(path, True)
+        with open(f"./result/small_world_network/result_framework_new_state_sir_20_step_{10 ** 8}_{p}.json", "w",
+                  encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        print(f'framework {10 ** 8}个节点p为{p}的网络结果已保存')
+
+    for seed in [0, 10000, 20000, 30000, 40000, 50000, 60000, 70000, 80000, 90000]:
+        path = f'./network/scale_free_net_10**8_seed{seed}.edgelist'
+        data = spread_main(path, True)
+        with open(f"./result/scale_free_network/1result_framework_new_state_sir_20_step_{10 ** 8}_seed{seed}.json", "w",
+                  encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        print(f'framework {10 ** 8}个节点seed为{seed}的网络结果已保存')
+def get_file_info(folder_path):
+    """获取文件夹中所有文件的文件名和绝对路径"""
+    folder = Path(folder_path)
+    file_info_list = []
+    # 遍历文件夹中所有条目（不递归子文件夹）
+    for item in folder.glob("*"):
+        # 只保留文件（排除文件夹）
+        if item.is_file():
+            file_info_list.append({
+                "file_name": item.name,
+                "file_path": str(item.resolve())
+            })
+    return file_info_list
+def real_main():
+
+    target_folder = "./network/real_network/undirected"
+    files = get_file_info(target_folder)
+    for f in files:
+        print(f"文件名: {f['file_name'][:-9]}")
+        print(f"路径: {f['file_path']}\n")
+        path = f['file_path']
+        filename = f['file_name'][:-9]
+        if filename == 'com-orkut':
+            data = spread_real_main(path, True, False)
+        else:
+            data = spread_real_main(path, False, False)
+        with open(f"./result/real_network/undirected/1result_framework_new_state_sir_20_step_{filename}.json", "w",
+                  encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        print(f'framework{filename}的网络结果已保存')
+
+    target_folder = "./network/real_network/directed"
+    files = get_file_info(target_folder)
+    for f in files:
+        print(f"文件名: {f['file_name'][:-9]}")
+        print(f"路径: {f['file_path']}\n")
+        path = f['file_path']
+        filename = f['file_name'][:-9]
+        if filename == 'soc-LiveJournal1' or filename == 'ego-gplus':
+            data = spread_real_main(path, True, True)
+        else:
+            data = spread_real_main(path, False, True)
+        with open(f"./result/real_network/directed/result_framework_new_state_sir_20_step_{filename}.json", "w",
+                  encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        print(f'framework {filename}的网络结果已保存')
+
+
+if __name__ == '__main__':
+    real_main()
+    main_2_7()
+    main_8()
